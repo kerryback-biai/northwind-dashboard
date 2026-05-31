@@ -33,7 +33,7 @@ def kpis():
     with conn.cursor() as cur:
         cur.execute("""
             SELECT
-                SUM(od."UnitPrice" * od."Quantity" * (1 - od."Discount")) AS total_revenue,
+                SUM(od."UnitPrice" * od."Quantity") AS total_revenue,
                 COUNT(DISTINCT o."OrderID")                                AS total_orders,
                 COUNT(DISTINCT o."CustomerID")                             AS active_customers
             FROM order_details od
@@ -56,8 +56,8 @@ def revenue_by_month():
     with conn.cursor() as cur:
         cur.execute("""
             SELECT
-                TO_CHAR(DATE_TRUNC('month', o."OrderDate"), 'YYYY-MM') AS month,
-                SUM(od."UnitPrice" * od."Quantity" * (1 - od."Discount")) AS revenue
+                TO_CHAR(DATE_TRUNC('month', o."OrderDate"::date), 'YYYY-MM') AS month,
+                SUM(od."UnitPrice" * od."Quantity") AS revenue
             FROM order_details od
             JOIN orders o ON od."OrderID" = o."OrderID"
             GROUP BY 1
@@ -75,7 +75,7 @@ def revenue_by_category():
         cur.execute("""
             SELECT
                 c."CategoryName",
-                SUM(od."UnitPrice" * od."Quantity" * (1 - od."Discount")) AS revenue
+                SUM(od."UnitPrice" * od."Quantity") AS revenue
             FROM order_details od
             JOIN orders o  ON od."OrderID"  = o."OrderID"
             JOIN products p ON od."ProductID" = p."ProductID"
@@ -96,7 +96,7 @@ def top_customers():
             SELECT
                 cu."CompanyName",
                 cu."Country",
-                SUM(od."UnitPrice" * od."Quantity" * (1 - od."Discount")) AS revenue,
+                SUM(od."UnitPrice" * od."Quantity") AS revenue,
                 COUNT(DISTINCT o."OrderID")                                AS orders
             FROM order_details od
             JOIN orders o   ON od."OrderID"   = o."OrderID"
