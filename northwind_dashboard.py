@@ -7,111 +7,121 @@ Run:  uvicorn northwind_dashboard:app --reload
 Then open http://127.0.0.1:8000
 """
 
+import asyncio
 import psycopg2
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 
 DB_URL = (
     "postgresql://northwind_reader:northwind_read_only"
     "@ep-patient-field-aqean10y.c-8.us-east-1.pg.koyeb.app:5432/koyebdb"
 )
 
+REFRESH_SECONDS = 300  # refresh cache every 5 minutes
+
 app = FastAPI(title="Northwind Dashboard")
 
+# In-memory cache populated at startup and refreshed on schedule
+_cache: dict = {}
 
-def get_connection():
-    return psycopg2.connect(DB_URL)
+
+def fetch_all_data() -> dict:
+    """Query the database and return all dashboard data."""
+    conn = psycopg2.connect(DB_URL)
+    with conn.cursor() as cur:
+
+        cur.execute("""
+            SELECT SUM(od."UnitPrice" * od."Quantity"),
+                   COUNT(DISTINCT o."OrderID"),
+                   COUNT(DISTINCT o."CustomerID")
+            FROM order_details od
+            JOIN orders o ON od."OrderID" = o."OrderID"
+        """)
+        total_rev, total_orders, customers = cur.fetchone()
+
+        cur.execute("""
+            SELECT TO_CHAR(DATE_TRUNC('month', o."OrderDate"::date), 'YYYY-MM'),
+                   SUM(od."UnitPrice" * od."Quantity")
+            FROM order_details od
+            JOIN orders o ON od."OrderID" = o."OrderID"
+            GROUP BY 1 ORDER BY 1
+        """)
+        monthly = [{"month": r[0], "revenue": round(r[1], 2)} for r in cur.fetchall()]
+
+        cur.execute("""
+            SELECT c."CategoryName", SUM(od."UnitPrice" * od."Quantity")
+            FROM order_details od
+            JOIN orders o ON od."OrderID" = o."OrderID"
+            JOIN products p ON od."ProductID" = p."ProductID"
+            JOIN categories c ON p."CategoryID" = c."CategoryID"
+            GROUP BY 1 ORDER BY 2 DESC
+        """)
+        categories = [{"category": r[0], "revenue": round(r[1], 2)} for r in cur.fetchall()]
+
+        cur.execute("""
+            SELECT cu."CompanyName", cu."Country",
+                   SUM(od."UnitPrice" * od."Quantity"),
+                   COUNT(DISTINCT o."OrderID")
+            FROM order_details od
+            JOIN orders o ON od."OrderID" = o."OrderID"
+            JOIN customers cu ON o."CustomerID" = cu."CustomerID"
+            GROUP BY cu."CustomerID", cu."CompanyName", cu."Country"
+            ORDER BY 3 DESC LIMIT 10
+        """)
+        top_customers = [
+            {"rank": i + 1, "company": r[0], "country": r[1],
+             "revenue": round(r[2], 2), "orders": r[3]}
+            for i, r in enumerate(cur.fetchall())
+        ]
+
+    conn.close()
+    return {
+        "kpis": {
+            "total_revenue":    round(total_rev, 2),
+            "total_orders":     total_orders,
+            "avg_order_value":  round(total_rev / total_orders, 2),
+            "active_customers": customers,
+        },
+        "monthly":       monthly,
+        "categories":    categories,
+        "top_customers": top_customers,
+    }
+
+
+async def refresh_loop():
+    while True:
+        _cache.update(fetch_all_data())
+        await asyncio.sleep(REFRESH_SECONDS)
+
+
+@app.on_event("startup")
+async def startup():
+    _cache.update(fetch_all_data())
+    asyncio.create_task(refresh_loop())
 
 
 # ---------------------------------------------------------------------------
-# API endpoints
+# API endpoints — serve from cache
 # ---------------------------------------------------------------------------
 
 @app.get("/api/kpis")
 def kpis():
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-                SUM(od."UnitPrice" * od."Quantity") AS total_revenue,
-                COUNT(DISTINCT o."OrderID")                                AS total_orders,
-                COUNT(DISTINCT o."CustomerID")                             AS active_customers
-            FROM order_details od
-            JOIN orders o ON od."OrderID" = o."OrderID"
-        """)
-        row = cur.fetchone()
-    conn.close()
-    total_rev, total_orders, customers = row
-    return {
-        "total_revenue":    round(total_rev, 2),
-        "total_orders":     total_orders,
-        "avg_order_value":  round(total_rev / total_orders, 2),
-        "active_customers": customers,
-    }
+    return _cache.get("kpis", {})
 
 
 @app.get("/api/revenue_by_month")
 def revenue_by_month():
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-                TO_CHAR(DATE_TRUNC('month', o."OrderDate"::date), 'YYYY-MM') AS month,
-                SUM(od."UnitPrice" * od."Quantity") AS revenue
-            FROM order_details od
-            JOIN orders o ON od."OrderID" = o."OrderID"
-            GROUP BY 1
-            ORDER BY 1
-        """)
-        rows = cur.fetchall()
-    conn.close()
-    return [{"month": r[0], "revenue": round(r[1], 2)} for r in rows]
+    return _cache.get("monthly", [])
 
 
 @app.get("/api/revenue_by_category")
 def revenue_by_category():
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-                c."CategoryName",
-                SUM(od."UnitPrice" * od."Quantity") AS revenue
-            FROM order_details od
-            JOIN orders o  ON od."OrderID"  = o."OrderID"
-            JOIN products p ON od."ProductID" = p."ProductID"
-            JOIN categories c ON p."CategoryID" = c."CategoryID"
-            GROUP BY 1
-            ORDER BY 2 DESC
-        """)
-        rows = cur.fetchall()
-    conn.close()
-    return [{"category": r[0], "revenue": round(r[1], 2)} for r in rows]
+    return _cache.get("categories", [])
 
 
 @app.get("/api/top_customers")
 def top_customers():
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-                cu."CompanyName",
-                cu."Country",
-                SUM(od."UnitPrice" * od."Quantity") AS revenue,
-                COUNT(DISTINCT o."OrderID")                                AS orders
-            FROM order_details od
-            JOIN orders o   ON od."OrderID"   = o."OrderID"
-            JOIN customers cu ON o."CustomerID" = cu."CustomerID"
-            GROUP BY cu."CustomerID", cu."CompanyName", cu."Country"
-            ORDER BY revenue DESC
-            LIMIT 10
-        """)
-        rows = cur.fetchall()
-    conn.close()
-    return [
-        {"rank": i + 1, "company": r[0], "country": r[1],
-         "revenue": round(r[2], 2), "orders": r[3]}
-        for i, r in enumerate(rows)
-    ]
+    return _cache.get("top_customers", [])
 
 
 # ---------------------------------------------------------------------------
